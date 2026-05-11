@@ -1,0 +1,721 @@
+import json
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+import requests
+
+
+# ============================================================
+# 1) DATATYPES
+# ============================================================
+
+@dataclass
+class Entity:
+    entity_id: str
+    label: str
+
+
+@dataclass
+class Claim:
+    text: str
+    status: str = "observed"
+    confidence: float = 1.0
+
+
+@dataclass
+class Articulation:
+    subject_id: str
+    predicate: str
+    value: str
+    dynamic_role: str = "neutral"
+    modality: str = "open"
+    scope: str = "local"
+    channel: str = "outer"
+    aspect: str = "neutral"
+    confidence: float = 1.0
+
+
+@dataclass
+class Role:
+    role_name: str
+    confidence: float = 1.0
+
+
+@dataclass
+class Perspective:
+    perspective_name: str
+    confidence: float = 1.0
+
+
+@dataclass
+class Identity:
+    name: Optional[str] = None
+    mode: Optional[str] = None
+    confidence: float = 1.0
+
+
+@dataclass
+class PerspectiveFrame:
+    roles: List[Role] = field(default_factory=list)
+    perspectives: List[Perspective] = field(default_factory=list)
+    identities: List[Identity] = field(default_factory=list)
+
+
+@dataclass
+class ArticulationFrame:
+    entities: List[Entity] = field(default_factory=list)
+    claims: List[Claim] = field(default_factory=list)
+    articulations: List[Articulation] = field(default_factory=list)
+    perspective_frame: Optional[PerspectiveFrame] = None
+
+
+@dataclass
+class MarginState:
+    m1_consistency: float = 1.0
+    m2_dao: float = 1.0
+    m3_identity: float = 1.0
+    s_tension: float = 0.0
+
+
+@dataclass
+class SITGateResult:
+    admissible: bool
+    contradiction_score: float = 0.0
+    meaning_shift_score: float = 0.0
+    dao_violation_score: float = 0.0
+    identity_drift_score: float = 0.0
+    violations: List[str] = field(default_factory=list)
+    margins: MarginState = field(default_factory=MarginState)
+
+
+@dataclass
+class UOLocalState:
+    fixierungsarbeit: float = 0.0
+    rueckkopplung: float = 0.0
+    kohaerenz: float = 0.0
+    attraktor: str = "kipppunkt"
+    dynamik_resonanz: float = 0.0
+    mikro_makro_resonanz: float = 0.0
+    innen_aussen_resonanz: float = 0.0
+    licht_schatten_balance: float = 0.5
+
+
+@dataclass
+class CoherenceMode:
+    raw_text: str
+    response_draft: Optional[str] = None
+    assumptions: List[str] = field(default_factory=list)
+    action_plan: Optional[Dict[str, Any]] = None
+    update_proposal: Optional[Dict[str, Any]] = None
+    frame: Optional[ArticulationFrame] = None
+    gate_result: Optional[SITGateResult] = None
+    uo_state: Optional[UOLocalState] = None
+    integration_mode: Optional[str] = None
+    strategic_score: float = 0.0
+    probability_score: float = 0.0
+    perspective_coverage_score: float = 0.0
+
+
+@dataclass
+class SystemState:
+    input_articulation: Optional[ArticulationFrame] = None
+    active_perspectives: PerspectiveFrame = field(default_factory=PerspectiveFrame)
+    history: List[CoherenceMode] = field(default_factory=list)
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+
+# ============================================================
+# 2) BACKEND
+# ============================================================
+
+class LLMBackend:
+    """
+    Kombiniert beide vorhandenen Backend-Ideen:
+    - echter lokaler Request an /api/generate
+    - robuster Dummy-Fallback, falls lokal nichts erreichbar ist
+    """
+
+    def __init__(self, base_url: str = "http://localhost:11434", model: str = "llama3.1"):
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+
+    def _dummy_response(self, prompt: str, n: int) -> List[str]:
+        snippet = prompt.strip().replace("\n", " ")[:160]
+        return [f"(UP-Dummy-Antwort) {snippet} ..." for _ in range(max(1, n))]
+
+    def generate(self, prompt: str, temperature: float = 0.3, n: int = 1) -> List[str]:
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "temperature": temperature,
+            "n": n,
+        }
+
+        try:
+            r = requests.post(f"{self.base_url}/api/generate", json=payload, timeout=60)
+            r.raise_for_status()
+            data = r.json()
+
+            if isinstance(data, dict):
+                if "results" in data and isinstance(data["results"], list):
+                    outputs = []
+                    for item in data["results"]:
+                        if isinstance(item, dict):
+                            outputs.append(item.get("text") or item.get("response") or "")
+                        else:
+                            outputs.append(str(item))
+                    return outputs or self._dummy_response(prompt, n)
+
+                if "response" in data:
+                    return [str(data["response"])]
+
+                if "text" in data:
+                    return [str(data["text"])]
+
+            if isinstance(data, list):
+                outputs = []
+                for item in data:
+                    if isinstance(item, dict):
+                        outputs.append(item.get("text") or item.get("response") or "")
+                    else:
+                        outputs.append(str(item))
+                return outputs or self._dummy_response(prompt, n)
+
+        except Exception:
+            pass
+
+        return self._dummy_response(prompt, n)
+
+
+# ============================================================
+# 3) READER / INFERER / GENERATOR
+# ============================================================
+
+class LocalArticulationReader:
+    def __init__(self, backend: LLMBackend):
+        self.backend = backend
+
+    def _heuristic_fallback(self, text: str) -> ArticulationFrame:
+        frame = ArticulationFrame()
+
+        for token in text.split():
+            cleaned = token.strip(".,:;!?()[]{}\"'")
+            if cleaned.istitle():
+                frame.entities.append(Entity(entity_id=str(uuid.uuid4()), label=cleaned))
+
+        frame.claims.append(Claim(text=text, status="observed", confidence=1.0))
+
+        frame.articulations.append(
+            Articulation(
+                subject_id="user",
+                predicate="says",
+                value=text,
+                dynamic_role="emergence",
+                modality="open",
+                scope="local",
+                channel="outer",
+                aspect="neutral",
+                confidence=1.0,
+            )
+        )
+        return frame
+
+    def read(self, text: str, state: SystemState) -> ArticulationFrame:
+        prompt = f"""
+Du bist der Local Articulation Reader eines UP-Systems.
+Extrahiere aus dem folgenden Text ausschließlich lokale Artikulationen.
+Nutze nur die Grundordnung UP als Quelle.
+
+Text:
+{text}
+
+Gib das Ergebnis als JSON mit Feldern:
+- entities: Liste von {{ "label": str }}
+- claims: Liste von {{ "text": str, "status": "observed" }}
+- articulations: Liste von {{
+    "subject": str,
+    "predicate": str,
+    "value": str,
+    "dynamic_role": str,
+    "modality": str,
+    "aspect": str
+}}
+"""
+        out = self.backend.generate(prompt)[0]
+
+        try:
+            data = json.loads(out)
+        except Exception:
+            return self._heuristic_fallback(text)
+
+        frame = ArticulationFrame()
+
+        for e in data.get("entities", []):
+            label = e.get("label") if isinstance(e, dict) else None
+            if label:
+                frame.entities.append(Entity(entity_id=str(uuid.uuid4()), label=label))
+
+        for c in data.get("claims", []):
+            if isinstance(c, dict):
+                frame.claims.append(
+                    Claim(
+                        text=c.get("text", text),
+                        status=c.get("status", "observed"),
+                        confidence=float(c.get("confidence", 1.0)),
+                    )
+                )
+
+        for a in data.get("articulations", []):
+            if isinstance(a, dict):
+                frame.articulations.append(
+                    Articulation(
+                        subject_id=a.get("subject", "user"),
+                        predicate=a.get("predicate", "says"),
+                        value=a.get("value", text),
+                        dynamic_role=a.get("dynamic_role", "neutral"),
+                        modality=a.get("modality", "open"),
+                        aspect=a.get("aspect", "neutral"),
+                    )
+                )
+
+        if not frame.claims:
+            frame.claims.append(Claim(text=text, status="observed", confidence=1.0))
+
+        if not frame.articulations:
+            frame.articulations.append(
+                Articulation(
+                    subject_id="user",
+                    predicate="says",
+                    value=text,
+                    dynamic_role="emergence",
+                    modality="open",
+                    aspect="neutral",
+                )
+            )
+
+        return frame
+
+
+class MultiPerspectiveInferer:
+    def __init__(self, backend: LLMBackend):
+        self.backend = backend
+
+    def _heuristic_fallback(self, text: str) -> PerspectiveFrame:
+        pf = PerspectiveFrame()
+        lower = text.lower()
+
+        if "ich" in lower:
+            pf.roles.append(Role("speaker"))
+        if "du" in lower:
+            pf.roles.append(Role("addressee"))
+        if "wir" in lower:
+            pf.roles.append(Role("collective"))
+
+        if "ich denke" in lower or "meiner meinung" in lower:
+            pf.perspectives.append(Perspective("subjective"))
+        if "man könnte" in lower or "es ist möglich" in lower:
+            pf.perspectives.append(Perspective("hypothetical"))
+        if "objektiv" in lower:
+            pf.perspectives.append(Perspective("objective"))
+
+        if "ich bin" in lower:
+            part = lower.split("ich bin", 1)[1].strip().split()
+            if part:
+                pf.identities.append(Identity(name=part[0], confidence=0.9))
+
+        if not pf.roles:
+            pf.roles.append(Role("implicit_speaker"))
+        if not pf.perspectives:
+            pf.perspectives.append(Perspective("neutral"))
+        if not pf.identities:
+            pf.identities.append(Identity(mode="implicit", confidence=0.5))
+
+        return pf
+
+    def infer(self, text: str, frame: ArticulationFrame, state: SystemState) -> PerspectiveFrame:
+        prompt = f"""
+Du bist der MultiPerspectiveInferer eines UP-Systems.
+Analysiere den Text ausschließlich im Rahmen der Grundordnung UP.
+
+Extrahiere:
+- Rollen (role_name)
+- Perspektiven (perspective_name)
+- Identitäten (name oder mode)
+
+Text:
+{text}
+
+Gib JSON zurück:
+{{
+  "roles": [{{"role_name": str}}],
+  "perspectives": [{{"perspective_name": str}}],
+  "identities": [{{"name": str, "mode": str}}]
+}}
+"""
+        out = self.backend.generate(prompt)[0]
+
+        try:
+            data = json.loads(out)
+        except Exception:
+            return self._heuristic_fallback(text)
+
+        pf = PerspectiveFrame()
+
+        for r in data.get("roles", []):
+            if isinstance(r, dict) and r.get("role_name"):
+                pf.roles.append(Role(r["role_name"], confidence=float(r.get("confidence", 1.0))))
+
+        for p in data.get("perspectives", []):
+            if isinstance(p, dict) and p.get("perspective_name"):
+                pf.perspectives.append(
+                    Perspective(
+                        p["perspective_name"],
+                        confidence=float(p.get("confidence", 1.0)),
+                    )
+                )
+
+        for i in data.get("identities", []):
+            if isinstance(i, dict):
+                pf.identities.append(
+                    Identity(
+                        name=i.get("name"),
+                        mode=i.get("mode"),
+                        confidence=float(i.get("confidence", 1.0)),
+                    )
+                )
+
+        if not pf.roles or not pf.perspectives or not pf.identities:
+            fallback = self._heuristic_fallback(text)
+            if not pf.roles:
+                pf.roles = fallback.roles
+            if not pf.perspectives:
+                pf.perspectives = fallback.perspectives
+            if not pf.identities:
+                pf.identities = fallback.identities
+
+        return pf
+
+
+class CoherenceModeGenerator:
+    def __init__(self, backend: LLMBackend, reader: LocalArticulationReader, candidates: int = 4):
+        self.backend = backend
+        self.reader = reader
+        self.candidates = candidates
+
+    def articulate_input(self, text: str, state: SystemState) -> Dict[str, Any]:
+        pf = state.active_perspectives
+        return {
+            "text": text,
+            "claims": [c.text for c in (state.input_articulation.claims if state.input_articulation else [])],
+            "entities": [e.label for e in (state.input_articulation.entities if state.input_articulation else [])],
+            "roles": [r.role_name for r in pf.roles],
+            "perspectives": [p.perspective_name for p in pf.perspectives],
+            "identities": [i.name or i.mode for i in pf.identities],
+        }
+
+    def _fallback_modes(self, view: Dict[str, Any]) -> List[CoherenceMode]:
+        text = view.get("text", "")
+        drafts = [
+            f"Ich halte die Artikulation offen und bleibe nah am Gesagten: {text}",
+            f"Eine vorsichtige kohärente Fortsetzung wäre: {text}",
+            f"Ich integriere die lokale Artikulation ohne unzulässige Schließung: {text}",
+            f"Das Feld lässt sich so tragen: {text}",
+        ]
+        modes = []
+        for draft in drafts[: self.candidates]:
+            modes.append(
+                CoherenceMode(
+                    raw_text=draft,
+                    response_draft=draft,
+                    assumptions=[],
+                    action_plan=None,
+                    update_proposal=None,
+                )
+            )
+        return modes
+
+    def generate(self, view: Dict[str, Any], state: SystemState) -> List[CoherenceMode]:
+        prompt = f"""
+Du bist der CoherenceModeGenerator eines UP-Systems.
+Erzeuge {self.candidates} mögliche kohärente Trageweisen (Coherence Modes)
+für die folgende lokale Artikulation:
+
+{json.dumps(view, ensure_ascii=False)}
+
+Jede Trageweise ist:
+- eine mögliche Antwort
+- eine mögliche Fortsetzung des Feldes
+- eine mögliche Interpretation
+
+Gib eine JSON-Liste zurück:
+[
+  {{
+    "response_draft": str,
+    "assumptions": [str],
+    "action_plan": null,
+    "update_proposal": null
+  }}
+]
+"""
+        out = self.backend.generate(prompt, n=1)[0]
+
+        try:
+            data = json.loads(out)
+            if not isinstance(data, list):
+                raise ValueError("Generator muss Liste liefern.")
+        except Exception:
+            modes = self._fallback_modes(view)
+            for mode in modes:
+                mode.frame = state.input_articulation
+            return modes
+
+        modes: List[CoherenceMode] = []
+        for d in data[: self.candidates]:
+            if not isinstance(d, dict):
+                continue
+            response_draft = d.get("response_draft", "") or ""
+            mode = CoherenceMode(
+                raw_text=response_draft,
+                response_draft=response_draft,
+                assumptions=d.get("assumptions", []),
+                action_plan=d.get("action_plan"),
+                update_proposal=d.get("update_proposal"),
+            )
+            mode.frame = state.input_articulation
+            modes.append(mode)
+
+        if not modes:
+            modes = self._fallback_modes(view)
+            for mode in modes:
+                mode.frame = state.input_articulation
+
+        return modes
+
+
+# ============================================================
+# 4) GATE / SCORING / ADVANCE
+# ============================================================
+
+class SITGate:
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        self.config = config or {}
+
+    def evaluate(self, mode: CoherenceMode, state: SystemState) -> SITGateResult:
+        text = (mode.raw_text or "").lower()
+        violations: List[str] = []
+
+        contradiction = 0.0
+        meaning_shift = 0.0
+        dao_violation = 0.0
+        identity_drift = 0.0
+
+        if "nicht" in text and "doch" in text:
+            contradiction += 0.2
+            violations.append("contradiction")
+
+        input_text = ""
+        if state.input_articulation and state.input_articulation.claims:
+            input_text = " ".join(claim.text.lower() for claim in state.input_articulation.claims)
+
+        if input_text:
+            input_tokens = {t for t in input_text.split() if len(t) > 3}
+            output_tokens = {t for t in text.split() if len(t) > 3}
+            overlap = len(input_tokens & output_tokens)
+            if input_tokens and overlap == 0:
+                meaning_shift += 0.25
+                violations.append("meaning_shift")
+
+        active_ids = [i.name or i.mode for i in state.active_perspectives.identities if (i.name or i.mode)]
+        if active_ids and "völlig andere identität" in text:
+            identity_drift += 0.4
+            violations.append("identity_drift")
+
+        admissible = (
+            contradiction < self.config.get("contradiction_threshold", 0.8)
+            and meaning_shift < self.config.get("meaning_shift_threshold", 0.8)
+            and dao_violation < self.config.get("dao_threshold", 0.8)
+            and identity_drift < self.config.get("identity_threshold", 0.8)
+        )
+
+        return SITGateResult(
+            admissible=admissible,
+            contradiction_score=contradiction,
+            meaning_shift_score=meaning_shift,
+            dao_violation_score=dao_violation,
+            identity_drift_score=identity_drift,
+            violations=violations,
+            margins=MarginState(
+                m1_consistency=max(0.0, 1 - contradiction),
+                m2_dao=max(0.0, 1 - dao_violation),
+                m3_identity=max(0.0, 1 - identity_drift),
+                s_tension=min(1.0, contradiction + meaning_shift + dao_violation + identity_drift),
+            ),
+        )
+
+
+def compute_uo_local(mode: CoherenceMode, gate: SITGateResult, state: SystemState) -> UOLocalState:
+    u = UOLocalState()
+
+    u.fixierungsarbeit = 0.2 + 0.3 * gate.contradiction_score + 0.2 * gate.meaning_shift_score
+    u.rueckkopplung = 0.4 + 0.4 * (1 - gate.margins.s_tension)
+    u.kohaerenz = u.rueckkopplung - u.fixierungsarbeit
+
+    if u.kohaerenz > 0.3:
+        u.attraktor = "integration"
+    elif u.kohaerenz < -0.3:
+        u.attraktor = "spaltung"
+    else:
+        u.attraktor = "kipppunkt"
+
+    u.dynamik_resonanz = u.kohaerenz
+    u.mikro_makro_resonanz = u.kohaerenz * 0.7
+    u.innen_aussen_resonanz = u.kohaerenz * 0.5
+    u.licht_schatten_balance = max(0.0, min(1.0, 0.5 + 0.5 * u.kohaerenz))
+
+    return u
+
+
+def compute_perspective_coverage(mode: CoherenceMode, state: SystemState) -> float:
+    pf = state.active_perspectives
+    score = 0.0
+    score += 0.2 * len(pf.roles)
+    score += 0.3 * len(pf.perspectives)
+    score += 0.5 * len(pf.identities)
+    return min(1.0, score)
+
+
+def strategic_score(mode: CoherenceMode) -> float:
+    if not mode.uo_state:
+        return 0.0
+    return mode.uo_state.rueckkopplung - abs(mode.uo_state.fixierungsarbeit)
+
+
+def probability_score(mode: CoherenceMode) -> float:
+    if not mode.uo_state:
+        return 0.0
+    return max(0.0, min(1.0, 0.5 + 0.5 * mode.uo_state.kohaerenz))
+
+
+def determine_integration_mode(mode: CoherenceMode, state: SystemState) -> str:
+    if not mode.gate_result or not mode.gate_result.admissible:
+        return "REJECT"
+
+    if not mode.uo_state:
+        return "QUARANTINE"
+
+    tension = mode.gate_result.margins.s_tension
+    coherence = mode.uo_state.kohaerenz
+
+    if tension >= 0.75:
+        return "QUARANTINE"
+    if coherence >= 0.25:
+        return "ACCEPT"
+    if coherence >= 0.05:
+        return "THROTTLE"
+    if coherence >= -0.15:
+        return "FORK"
+    return "QUARANTINE"
+
+
+def select_best_mode(modes: List[CoherenceMode]) -> CoherenceMode:
+    def score(m: CoherenceMode) -> float:
+        return (
+            0.45 * m.strategic_score
+            + 0.25 * m.probability_score
+            + 0.20 * m.perspective_coverage_score
+            + 0.10 * (m.uo_state.kohaerenz if m.uo_state else 0.0)
+        )
+
+    return max(modes, key=score)
+
+
+class UPFieldAdvancer:
+    def advance(self, state: SystemState, selected: CoherenceMode) -> None:
+        state.history.append(selected)
+        state.meta["last_selected_mode"] = selected.integration_mode
+        state.meta["last_kohaerenz"] = selected.uo_state.kohaerenz if selected.uo_state else None
+        state.meta["history_size"] = len(state.history)
+
+
+# ============================================================
+# 5) SYSTEM
+# ============================================================
+
+class UPSystem:
+    def __init__(self, backend: LLMBackend, sit_config: Optional[Dict[str, Any]] = None):
+        self.state = SystemState()
+        self.reader = LocalArticulationReader(backend)
+        self.perspective_inferer = MultiPerspectiveInferer(backend)
+        self.generator = CoherenceModeGenerator(backend, self.reader)
+        self.gate = SITGate(sit_config)
+        self.advancer = UPFieldAdvancer()
+
+    def process(self, user_text: str) -> str:
+        frame = self.reader.read(user_text, self.state)
+        self.state.input_articulation = frame
+
+        pf = self.perspective_inferer.infer(user_text, frame, self.state)
+        frame.perspective_frame = pf
+        self.state.active_perspectives = pf
+
+        view = self.generator.articulate_input(user_text, self.state)
+        modes = self.generator.generate(view, self.state)
+
+        executable: List[CoherenceMode] = []
+        quarantined: List[CoherenceMode] = []
+
+        for mode in modes:
+            gate_result = self.gate.evaluate(mode, self.state)
+            mode.gate_result = gate_result
+
+            if not gate_result.admissible:
+                mode.integration_mode = "REJECT"
+                continue
+
+            uo = compute_uo_local(mode, gate_result, self.state)
+            mode.uo_state = uo
+            mode.integration_mode = determine_integration_mode(mode, self.state)
+            mode.perspective_coverage_score = compute_perspective_coverage(mode, self.state)
+            mode.strategic_score = strategic_score(mode)
+            mode.probability_score = probability_score(mode)
+
+            if mode.integration_mode == "QUARANTINE":
+                quarantined.append(mode)
+            elif mode.integration_mode in {"ACCEPT", "THROTTLE", "FORK"}:
+                executable.append(mode)
+
+        if not executable:
+            return (
+                "Die aktuelle lokale Artikulation lässt sich nicht tragfähig in UP integrieren, "
+                "ohne Rollen-, Perspektiven- oder Identitätslagen unzulässig zu schließen. UP bleibt offen."
+            )
+
+        selected = select_best_mode(executable)
+        self.advancer.advance(self.state, selected)
+
+        return selected.response_draft or selected.raw_text
+
+
+# ============================================================
+# 6) CLI
+# ============================================================
+
+if __name__ == "__main__":
+    backend = LLMBackend()
+    up = UPSystem(backend, sit_config={})
+
+    while True:
+        try:
+            text = input("Du: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nUP: Beende Dialog.")
+            break
+
+        if not text:
+            continue
+        if text.lower() in {"exit", "quit", "ende"}:
+            print("UP: Beende Dialog.")
+            break
+
+        print("UP:", up.process(text))
